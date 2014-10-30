@@ -1,7 +1,5 @@
 package burp;
 
-import com.thoughtworks.xstream.XStream;
-import com.thoughtworks.xstream.io.xml.DomDriver;
 import java.awt.Component;
 import java.awt.event.ActionEvent;
 import java.io.ByteArrayInputStream;
@@ -20,11 +18,17 @@ import java.util.Arrays;
 import java.util.List;
 import java.util.logging.Level;
 import java.util.logging.Logger;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+
 import javax.swing.AbstractAction;
 import javax.swing.Action;
 import javax.swing.JMenuItem;
 
-public class BurpExtender implements IBurpExtender, IMessageEditorTabFactory, IContextMenuFactory {
+import com.thoughtworks.xstream.XStream;
+import com.thoughtworks.xstream.io.xml.DomDriver;
+
+public class BurpExtender implements IBurpExtender, IMessageEditorTabFactory, IContextMenuFactory, IScannerInsertionPointProvider {
 
     private IBurpExtenderCallbacks callbacks;
     private IExtensionHelpers helpers;
@@ -32,6 +36,7 @@ public class BurpExtender implements IBurpExtender, IMessageEditorTabFactory, IC
     private static final String LIB_DIR = "./libs/";
     private static PrintStream _stdout;
     private static PrintStream _stderr;
+    private static byte[] serializeMagic = new byte[]{-84, -19};
 
     //
     // implement IBurpExtender
@@ -55,6 +60,9 @@ public class BurpExtender implements IBurpExtender, IMessageEditorTabFactory, IC
         // register ourselves as a message editor tab factory
         callbacks.registerMessageEditorTabFactory(this);
         callbacks.registerContextMenuFactory(this);
+        
+        // register ourselves as a scanner insertion point provider
+        callbacks.registerScannerInsertionPointProvider(this);
         
     }
 
@@ -80,6 +88,23 @@ public class BurpExtender implements IBurpExtender, IMessageEditorTabFactory, IC
         return menu;
     }
     
+	private byte[] extractBody(byte[] content, boolean isRequest)
+	{
+		int offset = -1;
+		if(isRequest)
+			offset = helpers.analyzeRequest(content).getBodyOffset();
+		else 
+			offset = helpers.analyzeResponse(content).getBodyOffset();
+		if(offset == -1)
+			return new byte[]{};
+		return Arrays.copyOfRange(content, offset, content.length);
+	}
+	
+	private byte[] extractJavaClass(byte[] data) {
+		int magicPos = helpers.indexOf(data, serializeMagic, false, 0, data.length);
+		return Arrays.copyOfRange(data, magicPos, data.length);
+	}
+	
     class ReloadJarsAction extends AbstractAction {
 
         IContextMenuInvocation invocation;
@@ -97,6 +122,7 @@ public class BurpExtender implements IBurpExtender, IMessageEditorTabFactory, IC
         
     }
 
+
     //
     // class implementing IMessageEditorTab
     //
@@ -105,7 +131,6 @@ public class BurpExtender implements IBurpExtender, IMessageEditorTabFactory, IC
         private boolean editable;
         private ITextEditor txtInput;
         private byte[] currentMessage;
-        private byte[] serializeMagic = new byte[]{-84, -19};
         private Object obj;
         private byte[] crap;
         private XStream xstream = new XStream(new DomDriver());
@@ -118,8 +143,6 @@ public class BurpExtender implements IBurpExtender, IMessageEditorTabFactory, IC
             txtInput = callbacks.createTextEditor();
             txtInput.setEditable(editable);
         }
-
-        
         
         //
         // implement IMessageEditorTab
@@ -149,19 +172,10 @@ public class BurpExtender implements IBurpExtender, IMessageEditorTabFactory, IC
             } else {
                 CustomLoaderObjectInputStream is = null;
                 try {
-
-                    // save offsets
-                    int magicPos = helpers.indexOf(content, serializeMagic, false, 0, content.length);
-                    int msgBody = helpers.analyzeRequest(content).getBodyOffset();
-
-                    // get serialized data
-                    byte[] baSer = Arrays.copyOfRange(content, magicPos, content.length);
-
-                    // save the crap buffer for reconstruction
-                    crap = Arrays.copyOfRange(content, msgBody, magicPos);
-
-                    // deserialize the object
-                    ByteArrayInputStream bais = new ByteArrayInputStream(baSer);
+                    
+                    byte[] body = extractBody(content, isRequest);
+        			
+        			ByteArrayInputStream bais =  new ByteArrayInputStream(extractJavaClass(body));
 
                     // Use a custom OIS that uses our own ClassLoader
                     
@@ -186,6 +200,7 @@ public class BurpExtender implements IBurpExtender, IMessageEditorTabFactory, IC
             // remember the displayed content
             currentMessage = content;
         }
+        
 
         @Override
         public byte[] getMessage() {
@@ -266,4 +281,119 @@ public class BurpExtender implements IBurpExtender, IMessageEditorTabFactory, IC
     public static void refreshSharedClassLoader() {
         loader = createURLClassLoader(LIB_DIR);
     }
+
+	@Override
+	public List<IScannerInsertionPoint> getInsertionPoints(IHttpRequestResponse baseRequestResponse) {
+		byte[] content = baseRequestResponse.getRequest();
+		if(helpers.indexOf(content, serializeMagic, false, 0, content.length) > -1) {
+			// we are a java object
+			List<IScannerInsertionPoint> insertionPoints = new ArrayList<IScannerInsertionPoint>();
+			
+			int count = new ObjectInsertionPoint(content).getInsertionPointCount();
+			_stdout.println("Insertion count: " + count);
+			for (int i = 0; i <= count; i++) {
+				insertionPoints.add(new ObjectInsertionPoint(content, i));
+			}
+	        return insertionPoints;
+		}
+		return null;
+	}
+	
+	class ObjectInsertionPoint implements IScannerInsertionPoint
+	{
+		private String valueMatcher = "<value>(.+?)</value>";
+		private XStream xstream = new XStream(new DomDriver());
+		private byte[] request;
+		private Object obj;
+		private String objStr = "";
+		private int point = -1;
+		private String baseValue = "";
+
+		public ObjectInsertionPoint(byte[] request) {
+			this(request, -1);
+		}
+		
+		public ObjectInsertionPoint(byte[] request, int point) {
+			this.request = request;
+			this.point = point;
+			this.deserialize();
+			generateBaseValue();
+		}
+		
+        private void deserialize() {
+        	CustomLoaderObjectInputStream is = null;
+            try {
+            	byte[] body = extractBody(this.request, true);
+    			
+    			ByteArrayInputStream bais =  new ByteArrayInputStream(extractJavaClass(body));
+
+                // Use a custom OIS that uses our own ClassLoader
+                is = new CustomLoaderObjectInputStream(bais, getSharedClassLoader());
+                this.obj = is.readObject();
+                this.objStr = xstream.toXML(obj);
+            } catch (IOException | ClassNotFoundException ex) {
+                Logger.getLogger(BurpExtender.class.getName()).log(Level.SEVERE, null, ex);
+            } finally {
+                try {
+                    is.close();
+                } catch (IOException ex) {
+                    Logger.getLogger(BurpExtender.class.getName()).log(Level.SEVERE, null, ex);
+                }
+            }
+        }
+        
+        private void generateBaseValue() {
+        	Pattern pattern = Pattern.compile(valueMatcher);
+    		Matcher matcher = pattern.matcher(this.objStr);
+    		int i = 0;
+    		while (matcher.find()) {
+    			if (i == point) {
+    				String value = matcher.group();
+        			value = value.substring("<value>".length(), value.length());
+        			value = value.substring(0, value.length() - "</value>".length());
+        			this.baseValue = value;
+        			break;
+    			}
+    			i++;
+    		}
+        }
+
+		@Override
+		public String getInsertionPointName() {
+			return "JDSer Injection Point";
+		}
+
+		@Override
+		public String getBaseValue() {
+			return this.baseValue;
+		}
+        
+        public int getInsertionPointCount() {
+        	int i = 0;
+    		Pattern pattern = Pattern.compile(valueMatcher);
+    		Matcher matcher = pattern.matcher(this.objStr);
+    		while (matcher.find()) {
+    			i++;
+    		}
+        	return i;
+        }
+
+		@Override
+		public byte[] buildRequest(byte[] payload) {
+    		String replaced = helpers.bytesToString(payload).replace(this.baseValue, helpers.bytesToString(payload));
+			return helpers.stringToBytes(replaced);
+		}
+
+		@Override
+		public int[] getPayloadOffsets(byte[] payload) {
+			// no offsets due to serialization
+			return null;
+		}
+
+		@Override
+		public byte getInsertionPointType() {
+			return INS_EXTENSION_PROVIDED;
+		}
+
+	}
 }

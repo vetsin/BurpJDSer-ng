@@ -1,5 +1,9 @@
 /nbproject/private/
 /build/
+target
+.classpath
+.project
+.settings
 *.class
 *.war
 *.ear
